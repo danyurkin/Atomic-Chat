@@ -1527,14 +1527,16 @@ fn agent_install_spec(
             // script (NOT npm). `CONFIGURE=false` skips the post-install
             // interactive setup wizard — we write the agent's config ourselves
             // via `configure_goose`, so the wizard is redundant and would hang
-            // reading from /dev/tty when spawned from the app.
+            // reading from the console (/dev/tty on Unix) when spawned from the
+            // app. Both bootstrap scripts honor the `CONFIGURE` env var, so the
+            // Windows path seeds `$env:CONFIGURE='false'` before `iex`.
             let (program, args): (String, Vec<String>) = if cfg!(windows) {
                 (
                     "powershell".to_string(),
                     vec![
                         "-NoProfile".to_string(),
                         "-Command".to_string(),
-                        "irm https://github.com/block/goose/releases/download/stable/download_cli.ps1 | iex".to_string(),
+                        "$env:CONFIGURE='false'; irm https://github.com/block/goose/releases/download/stable/download_cli.ps1 | iex".to_string(),
                     ],
                 )
             } else {
