@@ -15,8 +15,16 @@ import {
 // Upstream provider points at the official ggml-org/llama.cpp release stream.
 // Note: this is intentionally NOT janhq/llama.cpp (legacy fork mirror) and
 // NOT AtomicBot-ai/atomic-llama-cpp-turboquant (our TurboQuant fork).
-const LLAMACPP_RELEASES_API =
-  'https://api.github.com/repos/ggml-org/llama.cpp/releases/latest'
+//
+// The release INDEX is now read from a self-hosted manifest published as a
+// GitHub release asset on a fixed tag, instead of api.github.com at runtime:
+// the unauthenticated GitHub API (60 req/hr/IP) silently rate-limited fresh
+// Windows installs into a no-backend dead-end (GH #56 / ATO-199). The manifest
+// MIRRORS GitHub's release JSON shape -- { tag_name, assets: [{ name }] } --
+// so the asset-name parsing below is unchanged. Asset DOWNLOADS still resolve
+// against the ggml-org CDN via LLAMACPP_DOWNLOAD_BASE; only the index moved.
+const LLAMACPP_BACKEND_MANIFEST_URL =
+  'https://github.com/AtomicBot-ai/Atomic-Chat/releases/download/backend-manifest/backends.json'
 const LLAMACPP_DOWNLOAD_BASE =
   'https://github.com/ggml-org/llama.cpp/releases/download'
 
@@ -127,7 +135,6 @@ export async function fetchRemoteBackends(): Promise<BackendVersion[]> {
   // tarball is hand-picked + re-codesigned at build time; we deliberately
   // don't pull from ggml-org at runtime.
   if (osType === 'macos') {
-    void LLAMACPP_RELEASES_API
     return []
   }
 
@@ -139,7 +146,9 @@ export async function fetchRemoteBackends(): Promise<BackendVersion[]> {
     arch.includes('aarch64') || arch.includes('arm64') ? 'arm64' : 'x64'
 
   try {
-    console.info(`[fetchRemoteBackends] Fetching ${LLAMACPP_RELEASES_API}...`)
+    console.info(
+      `[fetchRemoteBackends] Fetching ${LLAMACPP_BACKEND_MANIFEST_URL}...`
+    )
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 15_000)
     let resp: Response
@@ -147,9 +156,9 @@ export async function fetchRemoteBackends(): Promise<BackendVersion[]> {
       // Use the Tauri HTTP client (reqwest) so we can (a) honor the
       // user-configured HTTPS proxy from Settings → Proxy and (b) apply a
       // hard `connectTimeout`. The plain WebView `fetch` ignores the app's
-      // proxy config, which made this lookup fail on GitHub-restricted
-      // networks even when the user had a working proxy set up.
-      resp = await tauriFetch(LLAMACPP_RELEASES_API, {
+      // proxy config, which made this lookup fail on restricted networks
+      // even when the user had a working proxy set up.
+      resp = await tauriFetch(LLAMACPP_BACKEND_MANIFEST_URL, {
         headers: { 'User-Agent': 'atomic-chat' },
         signal: controller.signal,
         connectTimeout: 15_000,
@@ -159,16 +168,32 @@ export async function fetchRemoteBackends(): Promise<BackendVersion[]> {
       clearTimeout(timeout)
     }
     if (!resp.ok) {
-      const rateLimitRemaining = resp.headers.get('x-ratelimit-remaining')
+      // Distinguish the failure modes that matter operationally. 403/429 is the
+      // original ATO-199 rate-limit; 401 is auth; 5xx is host/CDN. We do not
+      // retry here (the manifest is a static asset on a fixed tag; the next
+      // hourly publish + the user's next launch are the natural retries), and
+      // we never retry-on-403. All cases degrade to last-good cache / local.
+      const status = resp.status
+      const kind =
+        status === 401
+          ? 'auth (401)'
+          : status === 403 || status === 429
+            ? 'rate-limited/forbidden (will NOT retry)'
+            : status >= 500
+              ? 'manifest host 5xx'
+              : `unexpected ${status}`
       console.warn(
-        `[fetchRemoteBackends] GitHub API returned ${resp.status} (rate-limit-remaining: ${rateLimitRemaining}), using local backends only`
+        `[fetchRemoteBackends] manifest fetch failed: ${kind}; falling back to last-good cache / local backends only`
       )
-      return []
+      return await readBackendManifestCache(osType, archSuffix)
     }
 
+    // Manifest mirrors GitHub's release JSON: { tag_name, assets:[{name}] }.
+    // `tag` (alias of tag_name) is accepted too so the publisher can emit
+    // either field name. Asset parsing below is therefore unchanged.
     const release = await resp.json()
-    const tag: string = release.tag_name
-    if (!tag) return []
+    const tag: string = release.tag_name ?? release.tag
+    if (!tag) return await readBackendManifestCache(osType, archSuffix)
 
     const assets: { name: string }[] = release.assets ?? []
     const escapedTag = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -208,6 +233,13 @@ export async function fetchRemoteBackends(): Promise<BackendVersion[]> {
         `[fetchRemoteBackends] Found ${backends.length} remote backends for win-${archSuffix}:`,
         backends.map((b) => b.backend)
       )
+      // Persist last-good so a later rate-limit/offline lookup degrades to the
+      // most recent successful catalog instead of []. GUARD: never cache an
+      // empty list — an empty catalog is exactly the "offline" signal callers
+      // (index.ts recommendation gate) rely on; caching it would poison it.
+      if (backends.length > 0) {
+        await writeBackendManifestCache(osType, archSuffix, backends)
+      }
       return backends
     }
 
@@ -239,9 +271,93 @@ export async function fetchRemoteBackends(): Promise<BackendVersion[]> {
       `[fetchRemoteBackends] Found ${backends.length} remote backends for linux-${archSuffix}:`,
       backends.map((b) => b.backend)
     )
+    if (backends.length > 0) {
+      await writeBackendManifestCache(osType, archSuffix, backends)
+    }
     return backends
   } catch (err) {
-    console.warn('[fetchRemoteBackends] Failed to fetch remote backends:', err)
+    // Network abort/timeout/dead-proxy all land here. Distinguish abort (our
+    // 15s timeout fired) from other transport errors for log clarity, then
+    // degrade to last-good cache rather than [] so a transient outage doesn't
+    // wipe the catalog.
+    const isAbort =
+      err != null && typeof err === 'object' && (err as { name?: string }).name === 'AbortError'
+    console.warn(
+      `[fetchRemoteBackends] Failed to fetch remote backends (${
+        isAbort ? 'timeout/abort' : 'transport error'
+      }):`,
+      err
+    )
+    return await readBackendManifestCache(osType, archSuffix)
+  }
+}
+
+/**
+ * Disk cache of the last *non-empty* remote backend catalog, keyed by
+ * os/arch. Lets a rate-limited / offline manifest lookup degrade to the most
+ * recent successful catalog instead of [] — without ever resurrecting an
+ * empty list (callers treat [] as the canonical "offline" signal).
+ *
+ * Stored under the same provider tree the rest of this module already owns:
+ *   <Jan data folder>/llamacpp-upstream/backend-manifest-cache-<os>-<arch>.json
+ */
+async function backendManifestCachePath(
+  osType: string,
+  archSuffix: string
+): Promise<string> {
+  const janDataFolderPath = await getJanDataFolderPath()
+  return await joinPath([
+    janDataFolderPath,
+    'llamacpp-upstream',
+    `backend-manifest-cache-${osType}-${archSuffix}.json`,
+  ])
+}
+
+async function writeBackendManifestCache(
+  osType: string,
+  archSuffix: string,
+  backends: BackendVersion[]
+): Promise<void> {
+  // GUARD: never cache empty — an empty catalog is the offline signal.
+  if (!backends || backends.length === 0) return
+  try {
+    const path = await backendManifestCachePath(osType, archSuffix)
+    await fs.writeFileSync(path, JSON.stringify(backends))
+  } catch (err) {
+    console.warn('[fetchRemoteBackends] Failed to write manifest cache:', err)
+  }
+}
+
+async function readBackendManifestCache(
+  osType: string,
+  archSuffix: string
+): Promise<BackendVersion[]> {
+  try {
+    const path = await backendManifestCachePath(osType, archSuffix)
+    if (!(await fs.existsSync(path))) return []
+    // Force a string return: this fs shim forwards args to the host IPC, and an
+    // encoding-less read can return a Buffer-like/object. Passing 'utf8' (as the
+    // app does elsewhere) guarantees a string so JSON.parse works — otherwise
+    // String(obj) yields "[object Object]" and the cache silently never loads.
+    const raw = await fs.readFileSync(path, 'utf8')
+    const text = typeof raw === 'string' ? raw : String(raw)
+    const parsed = JSON.parse(text)
+    if (!Array.isArray(parsed) || parsed.length === 0) return []
+    // Defensive: only surface well-formed entries.
+    const out: BackendVersion[] = []
+    for (const e of parsed) {
+      if (e && typeof e.version === 'string' && typeof e.backend === 'string') {
+        out.push({ version: e.version, backend: e.backend, order: 0 })
+      }
+    }
+    if (out.length > 0) {
+      console.info(
+        `[fetchRemoteBackends] Using last-good manifest cache (${out.length} backends for ${osType}-${archSuffix})`
+      )
+    }
+    return out
+  } catch (err) {
+    console.warn('[fetchRemoteBackends] Failed to read manifest cache:', err)
     return []
   }
 }

@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-06-17T20:37:00.000Z",
+  "tag_name": "b9690",
+  "assets": [
+    { "name": "llama-b9690-bin-win-cpu-x64.zip" },
+    { "name": "llama-b9690-bin-win-cuda-12.4-x64.zip" },
+    { "name": "llama-b9690-bin-win-cuda-13.3-x64.zip" },
+    { "name": "llama-b9690-bin-win-vulkan-x64.zip" },
+    { "name": "llama-b9690-bin-ubuntu-x64.tar.gz" },
+    { "name": "llama-b9690-bin-ubuntu-vulkan-x64.tar.gz" },
+    { "name": "cudart-llama-bin-win-cuda-12.4-x64.zip" },
+    { "name": "cudart-llama-bin-win-cuda-13.3-x64.zip" }
+  ]
+}

@@ -1,0 +1,73 @@
+name: Update backends manifest
+
+on:
+  schedule:
+    # Hourly at :37 (off-peak minute; avoids the :00 cron stampede on GitHub).
+    - cron: "37 * * * *"
+  workflow_dispatch: {}
+
+# Least privilege: write the release asset (contents scope) + open/update an
+# alert issue on failure (issues scope) so a frozen manifest is visible.
+permissions:
+  contents: write
+  issues: write
+
+# Never overlap runs; a hung run shouldn't block the next hour.
+concurrency:
+  group: update-backends-manifest
+  cancel-in-progress: false
+
+jobs:
+  update-manifest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Generate backends.json
+        env:
+          # Lifts api.github.com rate limits / avoids unauth 403s during resolution.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/update-backends-manifest.mjs
+
+      # Everything below runs ONLY if the generator above exited 0 (steps stop on
+      # first failure by default). On failure we never reach the upload -> last-good
+      # release asset is preserved.
+
+      - name: Ensure 'backend-manifest' release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! gh release view backend-manifest >/dev/null 2>&1; then
+            gh release create backend-manifest \
+              --title "Backend manifest" \
+              --notes "Auto-generated llama.cpp backend download manifest. Do not delete: the desktop app reads backends.json from this fixed tag." \
+              --latest=false
+          fi
+
+      - name: Publish backends.json to fixed release tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload backend-manifest backends.json --clobber
+
+      # M2 fix: the ONLY failure signal otherwise is a red Actions run nobody
+      # watches. If the generator failed (asset/CUDA-minor drift, >PER_PAGE churn,
+      # network), open or update a tracking issue so a frozen manifest is visible.
+      - name: Alert on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title="backends.json manifest update is failing"
+          body="The hourly manifest generator failed on run ${GITHUB_RUN_ID}. The last-good backends.json is still being served (no-overwrite-on-failure), but new llama.cpp releases are NOT flowing to users until this is fixed. Common causes: ggml-org renamed/added a CUDA minor, no complete release in the latest scanned page, or all download URLs failed verification. Run log: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          existing=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
