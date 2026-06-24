@@ -99,6 +99,20 @@ export const INTEGRATION_AGENTS: IntegrationAgent[] = [
     endpointWithPrefix: true,
   },
   {
+    id: 'zed',
+    name: 'Zed',
+    description: 'High-performance code editor with a built-in AI agent.',
+    kind: 'coding',
+    detectBin: 'zed',
+    docsUrl: 'https://zed.dev/docs/ai/llm-providers',
+    installable: true,
+    configurable: true,
+    requiresModel: true,
+    // Zed's native Atomic Chat provider expects the OpenAI-compatible base URL
+    // with the `/v1` prefix (matches its built-in default).
+    endpointWithPrefix: true,
+  },
+  {
     id: 'mimo',
     name: 'MiMo Code',
     description: "Xiaomi's open-source agentic coding tool for your terminal.",

@@ -1587,6 +1587,36 @@ fn agent_install_spec(
             let prereq = if cfg!(windows) { "powershell" } else { "curl" };
             Ok((program, args, prereq, "https://github.com/NousResearch/hermes-agent"))
         }
+        "zed" => {
+            // Zed ships its own installer (NOT npm). On macOS/Linux the official
+            // shell script downloads the editor and drops a `zed` CLI shim on
+            // PATH (`~/.local/bin`). On Windows it's distributed via winget.
+            if cfg!(windows) {
+                Ok((
+                    "winget".to_string(),
+                    vec![
+                        "install".to_string(),
+                        "--id".to_string(),
+                        "Zed.Zed".to_string(),
+                        "-e".to_string(),
+                        "--accept-package-agreements".to_string(),
+                        "--accept-source-agreements".to_string(),
+                    ],
+                    "winget",
+                    "https://zed.dev/docs/windows",
+                ))
+            } else {
+                Ok((
+                    "sh".to_string(),
+                    vec![
+                        "-c".to_string(),
+                        "curl -fsSL https://zed.dev/install.sh | sh".to_string(),
+                    ],
+                    "curl",
+                    "https://zed.dev/docs/getting-started",
+                ))
+            }
+        }
         other => Err(format!("Unknown or non-installable agent id: {}", other)),
     }
 }
@@ -2120,6 +2150,175 @@ pub fn configure_droid(
         selector
     );
     Ok(())
+}
+
+/// Display name (and provider id) of the custom provider we register in Zed.
+const ZED_PROVIDER_ID: &str = "Atomic Chat";
+
+/// Configure Zed by upserting a custom OpenAI-compatible provider named
+/// "Atomic Chat" under `language_models.openai_compatible` in
+/// `~/.config/zed/settings.json`, and (when a model is running) selecting it as
+/// the agent's default model.
+///
+/// We deliberately use Zed's built-in `openai_compatible` mechanism rather than
+/// the native `atomic_chat` provider: `openai_compatible` ships in every stock
+/// Zed release, so the integration works without building a custom Zed. The
+/// tradeoff is that stock Zed can't auto-discover models (we list the running
+/// one) and marks the provider "authenticated" only once a key is present — so
+/// we also seed the `ATOMIC_CHAT_API_KEY` env var on launch (see `launch_zed`).
+///
+/// Zed reads `settings.json` as JSONC (comments, trailing commas), so we parse
+/// leniently with json5 and re-serialize as strict JSON — any comments are
+/// dropped on write, every other setting is preserved.
+#[tauri::command]
+pub fn configure_zed(
+    api_url: String,
+    model: Option<String>,
+    // Accepted for call-site symmetry with the other agents. Zed reads the
+    // provider key from its keychain / the ATOMIC_CHAT_API_KEY env var, not
+    // from settings.json, so we don't persist it here.
+    api_key: Option<String>,
+) -> Result<(), String> {
+    let _ = api_key;
+    let home = agent_home_dir()?;
+    let dir = PathBuf::from(&home).join(".config").join("zed");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create ~/.config/zed: {}", e))?;
+    let path = dir.join("settings.json");
+
+    let mut root: serde_json::Value = if path.exists() {
+        let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        if text.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            json5::from_str(&text).map_err(|e| {
+                format!(
+                    "Could not parse {}: {}. Fix the reported location and try again.",
+                    path.display(),
+                    e
+                )
+            })?
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| "settings.json is not a JSON object".to_string())?;
+
+    // Navigate/create language_models.openai_compatible, preserving any other
+    // providers the user has configured.
+    let language_models = obj
+        .entry("language_models")
+        .or_insert_with(|| serde_json::json!({}));
+    if !language_models.is_object() {
+        *language_models = serde_json::json!({});
+    }
+    let compatible = language_models
+        .as_object_mut()
+        .unwrap()
+        .entry("openai_compatible")
+        .or_insert_with(|| serde_json::json!({}));
+    if !compatible.is_object() {
+        *compatible = serde_json::json!({});
+    }
+
+    // Stock Zed has no model auto-discovery for openai_compatible providers, so
+    // we advertise the currently-running model. If none is running we still
+    // register the provider (empty model list) so it appears in Zed's UI.
+    let mut available_models = Vec::new();
+    if let Some(model) = model.as_deref().filter(|m| !m.is_empty()) {
+        available_models.push(serde_json::json!({
+            "name": model,
+            "display_name": model,
+            "max_tokens": 32768,
+            "max_output_tokens": 8192,
+            "capabilities": {
+                "tools": true,
+                "images": true,
+                "parallel_tool_calls": false,
+                "prompt_cache_key": false
+            }
+        }));
+    }
+
+    compatible.as_object_mut().unwrap().insert(
+        ZED_PROVIDER_ID.to_string(),
+        serde_json::json!({
+            "api_url": api_url,
+            "available_models": available_models,
+        }),
+    );
+
+    // Select our model as the agent's default so Zed opens on it without a
+    // manual pick. For openai_compatible providers the provider id is the map
+    // key we just used (ZED_PROVIDER_ID).
+    if let Some(model) = model.as_deref().filter(|m| !m.is_empty()) {
+        let agent = obj.entry("agent").or_insert_with(|| serde_json::json!({}));
+        if !agent.is_object() {
+            *agent = serde_json::json!({});
+        }
+        agent.as_object_mut().unwrap().insert(
+            "default_model".to_string(),
+            serde_json::json!({ "provider": ZED_PROVIDER_ID, "model": model }),
+        );
+    }
+
+    let pretty = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    std::fs::write(&path, pretty + "\n")
+        .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+    log::info!("Zed configured: api_url={}, model={:?}", api_url, model);
+    Ok(())
+}
+
+/// Launch the Zed editor GUI.
+///
+/// Unlike the CLI agents we spawn in a terminal, Zed is a desktop editor whose
+/// agent lives in its own window, so we start the app directly. Prefer the
+/// `zed` CLI (resolved against the user's login-shell PATH so GUI builds find
+/// the `~/.local/bin` shim the installer drops); on macOS fall back to
+/// `open -a Zed` when the CLI shim isn't present.
+///
+/// We seed `ATOMIC_CHAT_API_KEY` so the custom openai_compatible provider is
+/// authenticated without the user pasting a key: stock Zed reads the provider
+/// key from the `<PROVIDER_ID>_API_KEY` env var and treats any non-empty value
+/// as authenticated, which is all a keyless local server needs. This only takes
+/// effect on a cold start (the CLI inherits our env); if Zed is already
+/// running, the key entered once in its UI persists in the keychain anyway.
+#[tauri::command]
+pub fn launch_zed() -> Result<(), String> {
+    // Non-empty placeholder: the local server is keyless, but Zed needs *some*
+    // key present to consider the provider authenticated.
+    const KEY_ENV: &str = "ATOMIC_CHAT_API_KEY";
+    const KEY_PLACEHOLDER: &str = "atomic";
+
+    let mut cmd = std::process::Command::new("zed");
+    apply_login_path(&mut cmd);
+    cmd.env(KEY_ENV, KEY_PLACEHOLDER);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    if cmd.spawn().is_ok() {
+        log::info!("Launched Zed via `zed` CLI");
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .args(["-a", "Zed"])
+            .env(KEY_ENV, KEY_PLACEHOLDER)
+            .spawn()
+            .map_err(|e| format!("Failed to launch Zed: {}", e))?;
+        log::info!("Launched Zed via `open -a Zed`");
+        return Ok(());
+    }
+
+    #[allow(unreachable_code)]
+    Err("Could not launch Zed. Is it installed and on your PATH?".to_string())
 }
 
 /// Configure OpenClaw by upserting `models.providers.atomic` plus the

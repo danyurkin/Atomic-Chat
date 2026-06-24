@@ -13,7 +13,8 @@
   "setCustomPath": "Set binary path",
   "customPathSet": "Binary path set",
   "savePath": "Save",
-  "customPathPlaceholder": "/path/to/binary or C:\\path\\to\\binary.exe",
+  "customPathPlaceholder": "/path/to/binary",
+  "customPathPlaceholderWindows": "C:\\path\\to\\binary.exe",
   "customPathHint": "Point at the agent's executable if it's installed in a non-standard location that auto-detection misses. This only affects the Installed status here.",
   "install": "Install",
   "installing": "Installing...",
@@ -40,6 +41,7 @@
     "installFailed": "Failed to install {{name}}",
     "configured": "{{name}} configured",
     "configuredDesc": "{{name}} now points at your local server — opening a terminal.",
+    "configuredDescEditor": "{{name}} now points at your local server — opening the editor.",
     "configureFailed": "Failed to configure {{name}}",
     "terminalFailed": "Couldn't open a terminal for {{name}}"
   }
