@@ -315,6 +315,11 @@ export function DownloadManagement() {
     (state: DownloadState) => {
       console.debug('onFileDownloadError', state)
 
+      // The validation toast never expires on its own. Diffusion transfers
+      // report a failed hash check through this handler rather than
+      // `onModelValidationFailed`, so it has to be dismissed here too.
+      toast.dismiss(`model-validation-started-${state.modelId}`)
+
       const anyState = state as unknown as {
         error?: string
         downloadType?: string
