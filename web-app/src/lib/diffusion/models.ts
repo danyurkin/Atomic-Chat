@@ -278,8 +278,10 @@ export function listInstalledArtifacts(
       const plan = planArtifactDownload(family, quant.id, files, '')
       const transformer = plan.entries.find((e) => e.kind === 'transformer')
       if (!transformer?.present) continue
+      // Optional files (Qwen-Image-2.1's vision projector, only fetched for
+      // Edit/Reference) do not make a Create-ready artifact incomplete.
       const missing = plan.entries
-        .filter((e) => !e.present)
+        .filter((e) => e.required && !e.present)
         .map((e) => e.relativePath)
       installed.push({
         id: plan.artifactId,

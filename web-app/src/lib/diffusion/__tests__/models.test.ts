@@ -367,6 +367,26 @@ describe('listInstalledArtifacts', () => {
   it('does not count a stray side file as an installed artifact', () => {
     expect(listInstalledArtifacts(catalog, [onDisk(SHARED_TE, QWEN3.bytes)])).toEqual([])
   })
+
+  it('treats Qwen-Image-2.1 as complete without its optional vision projector', () => {
+    const files = [
+      onDisk('qwen-image-2.1/qwen_image_2.1-Q4_K.gguf', 4_197_494_816),
+      onDisk(
+        'shared/Comfy-Org--Qwen-Image-2.1/qwen_image_2.1_vae_bf16.safetensors',
+        675_509_688
+      ),
+      onDisk(
+        'shared/Qwen--Qwen3-VL-8B-Instruct-GGUF/Qwen3VL-8B-Instruct-Q4_K_M.gguf',
+        5_027_784_800
+      ),
+    ]
+    const installed = listInstalledArtifacts(
+      getBaselineDiffusionCatalog(),
+      files
+    ).find((artifact) => artifact.family === 'qwen-image-2.1')
+
+    expect(installed).toMatchObject({ complete: true, missing: [] })
+  })
 })
 
 describe('planArtifactDeletion', () => {
